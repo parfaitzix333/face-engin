@@ -181,3 +181,46 @@ class FaceRecognizerMySQL:
             bbox=bbox,
             reconnu=reconnu,
         )
+
+    def reload_employee(self, employe_id: int):
+        """
+        Recharge les embeddings d'un seul employé depuis MySQL.
+        Si l'employé n'a plus d'embeddings, il est retiré du cache.
+        """
+        conn = pymysql.connect(**self.db_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT e.nom, e.matricule, ft.face_embedding
+                    FROM face_templates ft
+                    JOIN employes e ON e.id = ft.employe_id
+                    WHERE ft.employe_id = %s AND ft.annee_id = %s
+                    ORDER BY ft.id
+                    """,
+                    (employe_id, self.annee_id),
+                )
+
+                rows = cur.fetchall()
+
+                if not rows:
+                    self.employees.pop(employe_id, None)
+                    print(f"[CACHE] Employé {employe_id} retiré du cache.")
+                    return
+
+                nom = rows[0][0]
+                matricule = rows[0][1]
+                vectors = [blob_to_embedding(r[2]) for r in rows]
+
+                self.employees[employe_id] = {
+                    "nom": nom,
+                    "matricule": matricule,
+                    "matrix": np.stack(vectors),
+                }
+
+                print(
+                    f"[CACHE] Employé {employe_id} ({nom}) rechargé "
+                    f"({len(vectors)} embeddings)."
+                )
+        finally:
+            conn.close()
