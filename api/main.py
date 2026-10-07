@@ -10,12 +10,18 @@ Endpoints :
   GET  /employees       → liste les employés enrôlés
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException,Form
 from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
 
 from recognition_mysql import FaceRecognizerMySQL
+
+from typing import List
+import pymysql
+
+from face_core import FaceCore
+from db_config import DB_CONFIG
 
 
 # ==================================================
@@ -116,10 +122,135 @@ async def recognize(file: UploadFile = File(...)):
     }
 
 
+
+
+# Instance partagée du core (à initialiser au démarrage)
+face_core = FaceCore()
+
+
+@app.post("/enroll")
+async def enroll(
+    employe_id: int = Form(...),
+    files: List[UploadFile] = File(...),
+):
+    """
+    Enrôle un employé en stockant ses embeddings faciaux.
+    
+    - employe_id : ID de l'employé en base
+    - files : 5 photos du visage (angles variés recommandés)
+    """
+    
+    # --- 1. Validation ---
+    if len(files) < 1:
+        raise HTTPException(422, "Au moins une image est requise")
+    
+    if len(files) > 10:
+        raise HTTPException(422, "Maximum 10 images acceptées")
+    
+    # --- 2. Connexion MySQL ---
+    conn = pymysql.connect(**DB_CONFIG)
+    
+    try:
+        # Vérifier que l'employé existe
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT nom, matricule FROM employes WHERE id = %s",
+                (employe_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"Employé {employe_id} introuvable")
+            nom, matricule = row
+            
+            # Récupérer l'année active
+            cur.execute("SELECT id FROM annees WHERE statut='active' LIMIT 1")
+            annee_row = cur.fetchone()
+            if not annee_row:
+                raise HTTPException(500, "Aucune année active en base")
+            annee_id = annee_row[0]
+        
+        # --- 3. Extraire les embeddings ---
+        embeddings = []
+        details = []
+        
+        for i, file in enumerate(files, start=1):
+            try:
+                contents = await file.read()
+                arr = np.frombuffer(contents, np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                
+                if img is None:
+                    raise ValueError(f"Image illisible")
+                
+                face = face_core.extract_from_image(img)
+                
+                if face is None:
+                    raise HTTPException(
+                        400,
+                        f"Aucun visage détecté dans la photo {i} ({file.filename})"
+                    )
+                
+                embeddings.append(face["embedding"])
+                details.append({
+                    "index": i,
+                    "det_score": round(face["det_score"], 4),
+                    "source": file.filename,
+                })
+                
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(400, f"Erreur photo {i} : {str(e)}")
+        
+        # --- 4. Insertion en base ---
+        with conn.cursor() as cur:
+            # Supprimer les anciens embeddings de cet employé pour cette année
+            cur.execute(
+                "DELETE FROM face_templates WHERE employe_id=%s AND annee_id=%s",
+                (employe_id, annee_id)
+            )
+            
+            # Insérer les nouveaux
+            for emb in embeddings:
+                blob = emb.astype("<f4").tobytes()
+                assert len(blob) == 2048, f"Taille invalide : {len(blob)}"
+                
+                cur.execute(
+                    """
+                    INSERT INTO face_templates
+                        (employe_id, face_embedding, annee_id,
+                         created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    """,
+                    (employe_id, blob, annee_id)
+                )
+        
+        conn.commit()
+        recognizer.reload_employee(employe_id)
+        # --- 5. Réponse ---
+        return {
+            "employe_id": employe_id,
+            "nom": nom,
+            "matricule": matricule,
+            "n_embeddings": len(embeddings),
+            "annee_id": annee_id,
+            "message": "Enrôlement réussi",
+            "details": details,
+        }
+    
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(500, f"Erreur serveur : {str(e)}")
+    finally:
+        conn.close()
+
 # ==================================================
 # Lancement (si exécuté directement)
 # ==================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
